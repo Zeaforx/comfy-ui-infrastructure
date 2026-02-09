@@ -1,7 +1,0 @@
-**.tfvars
-credentials.json
-**/.terraform/**
-.terraform.lock.hcl
-**.code-workspace
-terraform.tfstate
-terraform.tfstate.backup
