@@ -52,7 +52,7 @@ resource "google_compute_firewall" "allow_comfy_ui_web" {
 
   allow {
     protocol = "tcp"
-    ports    = ["80", "443", "8188"]
+    ports    = ["80", "443", "8188", "8189"]
   }
 
   source_ranges = ["0.0.0.0/0"]
