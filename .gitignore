@@ -5,3 +5,6 @@ credentials.json
 **.code-workspace
 terraform.tfstate
 terraform.tfstate.backup
+.env
+workflows/
+scripts/__pycache__/

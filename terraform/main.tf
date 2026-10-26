@@ -2,11 +2,19 @@ resource "google_compute_instance" "comfy-ui-server" {
   name = "comfy-ui-server"
   zone = var.zone
 
-  # Custom N1 machine: 6 vCPUs, 16 GB RAM
-  machine_type = "custom-6-16384"
+  # N1 high-memory machine: 8 vCPUs, 52 GB RAM. The additional system memory
+  # provides headroom for ComfyUI model offloading alongside the 16 GB T4.
+  machine_type = "n1-highmem-8"
 
   # Script to run immidiately after startup
   metadata_startup_script = file("${path.module}/../scripts/startup.sh")
+
+  # Supplied from a local, gitignored tfvars file. The startup script uses it
+  # once to enroll a newly created VM in the private Tailscale network.
+  metadata = {
+    tailscale-auth-key = var.tailscale_auth_key
+    tailscale-hostname = var.tailscale_hostname
+  }
 
   tags = ["comfy-ui"]
 
@@ -44,17 +52,4 @@ resource "google_compute_instance" "comfy-ui-server" {
   }
 
   allow_stopping_for_update = true
-}
-
-resource "google_compute_firewall" "allow_comfy_ui_web" {
-  name    = "allow-comfy-ui-web"
-  network = "default"
-
-  allow {
-    protocol = "tcp"
-    ports    = ["80", "443", "8188", "8189"]
-  }
-
-  source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["comfy-ui"]
 }

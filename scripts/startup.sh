@@ -4,28 +4,80 @@
 # --------------------------------
 echo "Starting ComfyUI Setup..."
 export DEBIAN_FRONTEND=noninteractive
+BOOTSTRAP_MARKER="/var/lib/comfyui-bootstrap.complete"
+
+# GCE runs this startup script on every boot. Once provisioning has completed,
+# keep Spot-VM recovery fast: systemd restores Tailscale and both services
+# without reinstalling drivers, Python packages, or ComfyUI.
+if [ -f "$BOOTSTRAP_MARKER" ]; then
+    echo "ComfyUI is already provisioned; starting existing services..."
+    systemctl start tailscaled
+    systemctl start comfyui
+    systemctl start comfyui-downloader
+    tailscale serve --bg --http=8188 http://127.0.0.1:8188
+    exit 0
+fi
 
 apt-get update
-apt-get install -y git python3-venv python3-pip build-essential wget software-properties-common linux-headers-$(uname -r)
+apt-get install -y curl git python3-venv python3-pip build-essential wget software-properties-common linux-headers-$(uname -r)
+
+# 1a. Private network access through Tailscale
+# ---------------------------------------------
+# The ComfyUI firewall rule is intentionally removed from Terraform. This VM
+# joins the owner's Tailscale network using a key supplied as GCE metadata.
+echo "Installing Tailscale..."
+curl -fsSL https://tailscale.com/install.sh | sh
+systemctl enable --now tailscaled
+
+METADATA_URL="http://metadata.google.internal/computeMetadata/v1/instance/attributes"
+METADATA_HEADER="Metadata-Flavor: Google"
+TAILSCALE_AUTH_KEY="$(curl -fsS --retry 5 --retry-delay 2 -H "$METADATA_HEADER" "$METADATA_URL/tailscale-auth-key")"
+TAILSCALE_HOSTNAME="$(curl -fsS --retry 5 --retry-delay 2 -H "$METADATA_HEADER" "$METADATA_URL/tailscale-hostname")"
+
+if ! tailscale ip -4 >/dev/null 2>&1; then
+    if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+        echo "ERROR: Tailscale auth key is missing from instance metadata."
+        exit 1
+    fi
+
+    tailscale up --auth-key="$TAILSCALE_AUTH_KEY" --hostname="$TAILSCALE_HOSTNAME"
+fi
+
+# Do not retain the enrollment credential in the shell environment.
+unset TAILSCALE_AUTH_KEY
 
 # 2. Install NVIDIA Drivers & CUDA (Debian 12 specific)
 # -------------------------------------------------------
 echo "Installing NVIDIA Drivers..."
 
-# Add contrib and non-free repos if not already present
-if ! grep -q "non-free" /etc/apt/sources.list; then
+# Add contrib and non-free repositories. Debian's GCE image uses the newer
+# deb822 source format, while some Debian images still use sources.list.
+if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+    sed -i '/^Components:/ { /non-free/! s/$/ contrib non-free non-free-firmware/ }' /etc/apt/sources.list.d/debian.sources
+fi
+
+if [ -f /etc/apt/sources.list ] && ! grep -q "non-free" /etc/apt/sources.list; then
     sed -i 's/deb http:\/\/deb.debian.org\/debian bookworm main/deb http:\/\/deb.debian.org\/debian bookworm main contrib non-free non-free-firmware/' /etc/apt/sources.list
 fi
 
 apt-get update
 
-# Try to detect and install latest NVIDIA drivers
+# Try to detect and install an NVIDIA driver plus its diagnostic utility.
 apt-get install -y --no-install-recommends nvidia-driver-545 || \
 apt-get install -y --no-install-recommends nvidia-driver || \
 echo "WARNING: Driver installation may have issues. Will attempt CPU fallback."
+apt-get install -y --no-install-recommends libcuda1 nvidia-smi || \
+echo "WARNING: NVIDIA CUDA runtime utilities could not be installed. Will attempt CPU fallback."
 
-# Give driver time to load
-sleep 5
+# A driver installed during this boot needs one reboot before its kernel module
+# can be loaded. Reboot once, then continue this first-boot setup normally.
+DRIVER_REBOOT_MARKER="/var/lib/comfyui-driver-reboot-attempted"
+if command -v nvidia-smi >/dev/null 2>&1 && ! nvidia-smi >/dev/null 2>&1 && [ ! -f "$DRIVER_REBOOT_MARKER" ]; then
+    echo "NVIDIA driver installed; rebooting once to load its kernel module..."
+    touch "$DRIVER_REBOOT_MARKER"
+    systemctl reboot
+    exit 0
+fi
 
 # Check if GPU is detected
 if command -v nvidia-smi &> /dev/null; then
@@ -68,9 +120,6 @@ else
     sudo -u $SERVICE_USER git -C "$MANAGER_DIR" pull
 fi
 
-echo "Installing ComfyUI-Manager dependencies..."
-sudo -u $SERVICE_USER $COMFY_DIR/venv/bin/pip install -r "$MANAGER_DIR/requirements.txt" || echo "Warning: Manager deps install failed"
-
 # Ensure proper ownership
 chown -R $SERVICE_USER:$SERVICE_USER $COMFY_DIR
 
@@ -91,16 +140,40 @@ if [ ! -d "venv" ]; then
     sudo -u $SERVICE_USER python3 -m venv venv
 fi
 
-# Install PyTorch with CUDA support (Crucial for T4)
-# Using full path to venv's pip to avoid activation issues
+# Install a ComfyUI-compatible PyTorch release with CUDA support. CUDA 11.8 is
+# supported by the Debian NVIDIA 535 driver used for the T4 and avoids requiring
+# a newer proprietary CUDA driver on every disposable VM.
+# Using the full venv pip path avoids activation issues.
 echo "Installing PyTorch..."
 sudo -u $SERVICE_USER $COMFY_DIR/venv/bin/pip install --upgrade pip setuptools wheel
-sudo -u $SERVICE_USER $COMFY_DIR/venv/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+sudo -u $SERVICE_USER $COMFY_DIR/venv/bin/pip install --upgrade --force-reinstall \
+    torch==2.7.1+cu118 torchvision==0.22.1+cu118 torchaudio==2.7.1+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118
 
 # Install ComfyUI requirements
 echo "Installing ComfyUI dependencies..."
 sudo -u $SERVICE_USER $COMFY_DIR/venv/bin/pip install -r requirements.txt
 sudo -u $SERVICE_USER $COMFY_DIR/venv/bin/pip install flask requests
+
+# The virtual environment now exists, so install Manager dependencies into the
+# same environment used by ComfyUI.
+echo "Installing ComfyUI-Manager dependencies..."
+sudo -u $SERVICE_USER $COMFY_DIR/venv/bin/pip install -r "$MANAGER_DIR/requirements.txt" || echo "Warning: Manager deps install failed"
+
+# Permit explicit custom-node installs from Git URLs. ComfyUI is deliberately
+# bound to loopback below, which is also required by Manager for this option.
+MANAGER_CONFIG_DIR="$COMFY_DIR/user/__manager"
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$MANAGER_CONFIG_DIR"
+cat <<EOT > "$MANAGER_CONFIG_DIR/config.ini"
+[default]
+allow_git_url_install = true
+allow_pip_install = false
+EOT
+# install creates missing intermediate directories as root. ComfyUI needs to
+# create its default profile, settings, and optional user.css beneath user/.
+chown -R "$SERVICE_USER:$SERVICE_USER" "$COMFY_DIR/user"
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$COMFY_DIR/user/default/workflows"
+install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0644 /dev/null "$COMFY_DIR/user/default/user.css"
 
 
 # 6. Create Systemd Service (Auto-start)
@@ -109,10 +182,10 @@ echo "Creating Systemd Service..."
 
 # Determine GPU availability for startup flags
 if command -v nvidia-smi &> /dev/null; then
-    COMFY_FLAGS="--listen 0.0.0.0 --port 8188"
-    echo "GPU detected - ComfyUI will use CUDA acceleration"
+    COMFY_FLAGS="--listen 127.0.0.1 --port 8188 --lowvram"
+    echo "GPU detected - ComfyUI will use CUDA acceleration in low-VRAM mode"
 else
-    COMFY_FLAGS="--listen 0.0.0.0 --port 8188 --cpu"
+    COMFY_FLAGS="--listen 127.0.0.1 --port 8188 --cpu"
     echo "No GPU detected - ComfyUI will run in CPU mode (slower)"
 fi
 
@@ -143,6 +216,10 @@ chmod 644 /etc/systemd/system/comfyui.service
 systemctl daemon-reload
 systemctl enable comfyui
 systemctl start comfyui
+
+# Keep ComfyUI loopback-only while making the same port available privately to
+# devices in this tailnet. Background Serve configuration survives reboots.
+tailscale serve --bg --http=8188 http://127.0.0.1:8188
 
 # 8. Setup Custom Model Downloader Service
 # ----------------------------------------
@@ -409,4 +486,10 @@ systemctl daemon-reload
 systemctl enable comfyui-downloader
 systemctl start comfyui-downloader
 
+if ! systemctl is-active --quiet comfyui || ! systemctl is-active --quiet comfyui-downloader; then
+    echo "ERROR: ComfyUI provisioning did not start all required services. Bootstrap will retry on the next boot."
+    exit 1
+fi
+
+touch "$BOOTSTRAP_MARKER"
 echo "Setup Complete! Model downloader running on port 8189."

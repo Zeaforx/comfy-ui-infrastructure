@@ -1,0 +1,8 @@
+# Copy this file to terraform.tfvars, which is intentionally ignored by Git.
+# Do not commit a real auth key.
+project_id = "YOUR_GCP_PROJECT_ID"
+
+# In the Tailscale admin console: Settings > Keys > Generate auth key.
+# Use a reusable server key. A tag is optional for a personal setup.
+tailscale_auth_key = "tskey-auth-REPLACE_WITH_YOUR_KEY"
+tailscale_hostname = "comfyui"
